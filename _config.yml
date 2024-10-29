@@ -1,0 +1,15 @@
+# Jekyll configuration file
+
+# Include the docs directory in the build process
+include:
+    - docs
+
+# Set the base URL for the site
+baseurl: "/Mapapi"
+
+# Set the URL for the site
+url: "https://223mapaction.github.io"
+
+# Other configurations
+markdown: kramdown
+theme: minima

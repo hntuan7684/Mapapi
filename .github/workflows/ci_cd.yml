@@ -1,0 +1,202 @@
+name: CI/CD Pipeline
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        branches:
+            - main
+
+jobs:
+    cleanup:
+        runs-on: self-hosted
+        steps:
+            - name: Free up disk space
+              run: |
+                  sudo docker system prune -af
+                  sudo docker volume prune -f
+                  sudo apt-get clean
+                  sudo df -h
+
+    setup-and-test:
+        needs: cleanup
+        runs-on: self-hosted
+        steps:
+            - name: Checkout Repository
+              uses: actions/checkout@v3
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@v2
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_PASSWORD }}
+            - name: Set up Python 3.x
+              uses: actions/setup-python@v4
+              with:
+                  python-version: "3.x"
+
+            - name: Create .env file
+              run: |
+                  {
+                    echo "ALLOWED_HOSTS=${{ secrets.ALLOWED_HOSTS }}"
+                    echo "ANDROID_CLIENT_ID=${{ secrets.ANDROID_CLIENT_ID }}"
+                    echo "DB_HOST=${{ secrets.DB_HOST }}"
+                    echo "DJANGO_SUPERUSER_EMAIL=${{ secrets.DJANGO_SUPERUSER_EMAIL }}"
+                    echo "DJANGO_SUPERUSER_FIRST_NAME=${{ secrets.DJANGO_SUPERUSER_FIRST_NAME }}"
+                    echo "DJANGO_SUPERUSER_LAST_NAME=${{ secrets.DJANGO_SUPERUSER_LAST_NAME }}"
+                    echo "DJANGO_SUPERUSER_PASSWORD=${{ secrets.DJANGO_SUPERUSER_PASSWORD }}"
+                    echo "DJANGO_SUPERUSER_USERNAME=${{ secrets.DJANGO_SUPERUSER_USERNAME }}"
+                    echo "IOS_CLIENT_ID=${{ secrets.IOS_CLIENT_ID }}"
+                    echo "PORT=${{ secrets.PORT }}"
+                    echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}"
+                    echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}"
+                    echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}"
+                    echo "SECRET_KEY=${{ secrets.SECRET_KEY }}"
+                    echo "WEB_CLIENT_ID=${{ secrets.WEB_CLIENT_ID }}"
+                    echo "WEB_CLIENT_SECRET=${{ secrets.WEB_CLIENT_SECRET }}"
+                  } > .env
+
+            - name: Run Tests
+              env:
+                  ALLOWED_HOSTS: ${{ secrets.ALLOWED_HOSTS }}
+                  ANDROID_CLIENT_ID: ${{ secrets.ANDROID_CLIENT_ID }}
+                  DB_HOST: ${{ secrets.DB_HOST }}
+                  DJANGO_SUPERUSER_EMAIL: ${{ secrets.DJANGO_SUPERUSER_EMAIL }}
+                  DJANGO_SUPERUSER_FIRST_NAME: ${{ secrets.DJANGO_SUPERUSER_FIRST_NAME }}
+                  DJANGO_SUPERUSER_LAST_NAME: ${{ secrets.DJANGO_SUPERUSER_LAST_NAME }}
+                  DJANGO_SUPERUSER_PASSWORD: ${{ secrets.DJANGO_SUPERUSER_PASSWORD }}
+                  DJANGO_SUPERUSER_USERNAME: ${{ secrets.DJANGO_SUPERUSER_USERNAME }}
+                  IOS_CLIENT_ID: ${{ secrets.IOS_CLIENT_ID }}
+                  PORT: ${{ secrets.PORT }}
+                  POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+                  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+                  POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+                  SECRET_KEY: ${{ secrets.SECRET_KEY }}
+                  TEST_POSTGRES_DB: ${{ secrets.TEST_POSTGRES_DB }}
+                  WEB_CLIENT_ID: ${{ secrets.WEB_CLIENT_ID }}
+                  WEB_CLIENT_SECRET: ${{ secrets.WEB_CLIENT_SECRET }}
+              run: |
+                  mkdir -p coverage
+                  chmod 777 coverage
+                  docker-compose -f _ci_pipeline.yml pull
+                  docker-compose -f _ci_pipeline.yml up --build -d
+                  docker exec api-server-test bash -c "
+                    python3 manage.py wait_for_db &&
+                    python3 -m pytest --verbose --cov=. --cov-report=xml:/tmp/coverage.xml --cov-report=term-missing | tee /tmp/coverage_report.txt
+                  "
+                  docker cp api-server-test:/tmp/coverage.xml /home/azureuser/coverage/coverage.xml
+                  docker cp api-server-test:/tmp/coverage_report.txt /home/azureuser/coverage/coverage_report.txt
+                  sudo chown -R $USER:$USER /home/azureuser/coverage
+                  docker-compose -f _ci_pipeline.yml down
+
+            - name: Upload coverage reports to Codecov
+              uses: codecov/codecov-action@v4
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  files: /home/azureuser/coverage/coverage.xml
+                  fail_ci_if_error: true
+
+            - name: Check coverage
+              id: coverage
+              run: |
+                  COVERAGE=$(grep TOTAL /home/azureuser/coverage/coverage_report.txt | awk '{print $NF}' | sed 's/%//')
+
+                  echo "Coverage: $COVERAGE%"
+                  if (( $(echo "$COVERAGE < 40" | bc -l) )); then
+                      echo "Coverage below threshold"
+                      exit 1
+                  else
+                      echo "Coverage meets threshold"
+                  fi
+
+    deploy:
+        needs: setup-and-test
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        runs-on: self-hosted
+        permissions: write-all
+        steps:
+            - name: Checkout Repository
+              uses: actions/checkout@v3
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@v2
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_PASSWORD }}
+
+            - name: Create entrypoint.sh
+              run: |
+                  cat > entrypoint.sh << 'EOL'
+                  #!/bin/sh
+                  set -e
+
+                  # Wait for postgres to be ready
+                  python manage.py wait_for_db
+
+                  # Apply database migrations
+                  python manage.py migrate
+
+                  # Create superuser if it doesn't exist
+                  python manage.py createsuperuser --noinput || true
+
+                  # Start server
+                  exec python manage.py runserver 0.0.0.0:8000
+                  EOL
+              shell: bash
+              continue-on-error: false
+
+            - name: Create .env file
+              run: |
+                  {
+                    echo "ALLOWED_HOSTS=${{ secrets.ALLOWED_HOSTS }}"
+                    echo "ANDROID_CLIENT_ID=${{ secrets.ANDROID_CLIENT_ID }}"
+                    echo "DB_HOST=${{ secrets.DB_HOST }}"
+                    echo "DJANGO_SUPERUSER_EMAIL=${{ secrets.DJANGO_SUPERUSER_EMAIL }}"
+                    echo "DJANGO_SUPERUSER_FIRST_NAME=${{ secrets.DJANGO_SUPERUSER_FIRST_NAME }}"
+                    echo "DJANGO_SUPERUSER_LAST_NAME=${{ secrets.DJANGO_SUPERUSER_LAST_NAME }}"
+                    echo "DJANGO_SUPERUSER_PASSWORD=${{ secrets.DJANGO_SUPERUSER_PASSWORD }}"
+                    echo "DJANGO_SUPERUSER_USERNAME=${{ secrets.DJANGO_SUPERUSER_USERNAME }}"
+                    echo "IOS_CLIENT_ID=${{ secrets.IOS_CLIENT_ID }}"
+                    echo "PORT=${{ secrets.PORT }}"
+                    echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}"
+                    echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}"
+                    echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}"
+                    echo "SECRET_KEY=${{ secrets.SECRET_KEY }}"
+                    echo "WEB_CLIENT_ID=${{ secrets.WEB_CLIENT_ID }}"
+                    echo "WEB_CLIENT_SECRET=${{ secrets.WEB_CLIENT_SECRET }}"
+                  } > .env
+
+            - name: Build and Run Docker Compose
+              env:
+                  ALLOWED_HOSTS: ${{ secrets.ALLOWED_HOSTS }}
+                  ANDROID_CLIENT_ID: ${{ secrets.ANDROID_CLIENT_ID }}
+                  DB_HOST: ${{ secrets.DB_HOST }}
+                  DJANGO_SUPERUSER_EMAIL: ${{ secrets.DJANGO_SUPERUSER_EMAIL }}
+                  DJANGO_SUPERUSER_FIRST_NAME: ${{ secrets.DJANGO_SUPERUSER_FIRST_NAME }}
+                  DJANGO_SUPERUSER_LAST_NAME: ${{ secrets.DJANGO_SUPERUSER_LAST_NAME }}
+                  DJANGO_SUPERUSER_PASSWORD: ${{ secrets.DJANGO_SUPERUSER_PASSWORD }}
+                  DJANGO_SUPERUSER_USERNAME: ${{ secrets.DJANGO_SUPERUSER_USERNAME }}
+                  IOS_CLIENT_ID: ${{ secrets.IOS_CLIENT_ID }}
+                  PORT: ${{ secrets.PORT }}
+                  POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+                  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+                  POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+                  SECRET_KEY: ${{ secrets.SECRET_KEY }}
+                  TEST_POSTGRES_DB: ${{ secrets.TEST_POSTGRES_DB }}
+                  WEB_CLIENT_ID: ${{ secrets.WEB_CLIENT_ID }}
+                  WEB_CLIENT_SECRET: ${{ secrets.WEB_CLIENT_SECRET }}
+              run: |
+                  # Conditionally remove existing network if it exists
+                  docker network ls | grep -q mapapi_micro-services-network && docker network rm mapapi_micro-services-network || true
+
+                  # Build and run Docker Compose
+                  docker-compose -f _cd_pipeline.yml up --build -d
+
+            - name: Post-deployment cleanup
+              if: always()
+              run: |
+                  # Clean up dangling volumes and images
+                  docker system prune -af --volumes
+                  docker image prune -af
+                  docker volume prune -f
